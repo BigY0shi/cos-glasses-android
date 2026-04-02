@@ -1,0 +1,18 @@
+{
+  "name": "@gotcos/glasses-server",
+  "version": "5.0.0",
+  "description": "COS Glasses — AI heads-up display for Even G2 smart glasses, powered by Claude",
+  "bin": {
+    "glasses-server": "./bin/cli.js"
+  },
+  "keywords": ["even-g2", "smart-glasses", "claude", "ai", "cos"],
+  "author": "COS Contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ukaoma/cos-glasses-server.git"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
