@@ -4,7 +4,7 @@
 // Downloads and runs the COS Glasses server for Even G2 smart glasses
 
 const { execSync, spawn } = require('child_process')
-const { existsSync, mkdirSync, statSync, readFileSync, copyFileSync } = require('fs')
+const { existsSync, mkdirSync, statSync, readFileSync, copyFileSync, unlinkSync, renameSync } = require('fs')
 const { join, resolve } = require('path')
 const { homedir } = require('os')
 
@@ -130,38 +130,101 @@ if (!existsSync(envFile) && existsSync(envExample)) {
 // users won't know they're being billed unless we tell them at startup.
 //
 // Detection mirrors what server/lib/whisper-local.ts looks for at runtime:
-//   - whisper-cli binary (brew install whisper-cpp)
-//   - ggml-large-v3-turbo.bin model (~3.1GB, downloaded from Hugging Face)
-const WHISPER_CLI_PATH = '/opt/homebrew/bin/whisper-cli'
+//   - whisper-cli binary (brew install whisper-cpp on macOS, native on Linux)
+//   - ggml-large-v3-turbo.bin model (~1.5 GB, downloaded from Hugging Face)
+//
+// Probe order: known Homebrew paths (Apple Silicon + Intel), then PATH lookup
+// via `command -v` for Linux/custom installs. (v5.3.2 fix — was Apple Silicon
+// only, broke detection for Intel Macs and any non-Homebrew install.)
+const WHISPER_KNOWN_PATHS = [
+  '/opt/homebrew/bin/whisper-cli',  // Apple Silicon Homebrew
+  '/usr/local/bin/whisper-cli',     // Intel Homebrew
+]
 const WHISPER_MODEL_DIR = join(homedir(), '.local/share/whisper-models')
 const WHISPER_MODEL_PATH = join(WHISPER_MODEL_DIR, 'ggml-large-v3-turbo.bin')
+const WHISPER_MODEL_PARTIAL = WHISPER_MODEL_PATH + '.partial'
 const WHISPER_MODEL_URL = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin'
+// large-v3-turbo is ~1.5 GB on disk; reject anything smaller than 800 MB as a
+// partial download (curl interrupted by Ctrl-C, network drop, disk full).
+const WHISPER_MODEL_MIN_BYTES = 800_000_000
 
-const hasWhisperCli = existsSync(WHISPER_CLI_PATH)
-const hasWhisperModel = existsSync(WHISPER_MODEL_PATH)
-
-if (hasWhisperCli && hasWhisperModel) {
-  console.log(green('  \u2713') + ' whisper.cpp + model ready ' + dim('— voice = local (FREE)'))
-} else if (hasWhisperCli && !hasWhisperModel) {
-  console.log(yellow('  \u26a0') + ' whisper.cpp installed but model missing')
-  console.log('    ' + dim('Downloading large-v3-turbo (~3.1GB) from Hugging Face...'))
-  console.log('    ' + dim('Cancel with Ctrl-C if you prefer to skip — server will use OpenAI API instead.'))
+function findWhisperCli() {
+  // Check known Homebrew install paths first (zero subprocess cost)
+  for (const p of WHISPER_KNOWN_PATHS) {
+    if (existsSync(p)) return p
+  }
+  // Fall back to shell PATH lookup for Linux / custom installs
   try {
-    mkdirSync(WHISPER_MODEL_DIR, { recursive: true })
-    execSync(`curl -fL --progress-bar "${WHISPER_MODEL_URL}" -o "${WHISPER_MODEL_PATH}"`, {
-      stdio: 'inherit',
-      timeout: 600000  // 10 min for slow networks
-    })
-    console.log(green('  \u2713') + ' Model downloaded ' + dim('— voice = local (FREE)'))
-  } catch (err) {
-    console.log(red('  \u2717') + ' Model download failed ' + dim('— voice will use OpenAI API'))
-    console.log('    ' + dim('Manual: curl -fL ' + WHISPER_MODEL_URL + ' -o ' + WHISPER_MODEL_PATH))
+    const found = execSync('command -v whisper-cli 2>/dev/null', {
+      shell: '/bin/sh',
+      stdio: 'pipe',
+      timeout: 2000
+    }).toString().trim()
+    return found || null
+  } catch {
+    return null
+  }
+}
+
+function isValidWhisperModel(path) {
+  if (!existsSync(path)) return false
+  try {
+    return statSync(path).size >= WHISPER_MODEL_MIN_BYTES
+  } catch {
+    return false
+  }
+}
+
+const whisperCliPath = findWhisperCli()
+const hasValidModel = isValidWhisperModel(WHISPER_MODEL_PATH)
+
+if (whisperCliPath && hasValidModel) {
+  console.log(green('  \u2713') + ' whisper.cpp + model ready ' + dim('— voice = local (FREE)'))
+} else if (whisperCliPath && !hasValidModel) {
+  // CLI installed but model missing or partial — clean up any junk and download
+  if (existsSync(WHISPER_MODEL_PATH)) {
+    console.log(yellow('  \u26a0') + ' Existing whisper model is incomplete — re-downloading')
+    try { unlinkSync(WHISPER_MODEL_PATH) } catch {}
+  }
+  if (existsSync(WHISPER_MODEL_PARTIAL)) {
+    try { unlinkSync(WHISPER_MODEL_PARTIAL) } catch {}
+  }
+  console.log(yellow('  \u26a0') + ' whisper.cpp installed but model missing')
+  console.log('    ' + dim('Downloading ggml-large-v3-turbo (~1.5 GB) from Hugging Face...'))
+  console.log('    ' + dim('Cancel with Ctrl-C — server will use OpenAI API instead.'))
+  console.log('    ' + dim('Skip permanently: SKIP_WHISPER_DOWNLOAD=1 npx @gotcos/glasses-server'))
+  if (process.env.SKIP_WHISPER_DOWNLOAD === '1') {
+    console.log(yellow('  \u26a0') + ' SKIP_WHISPER_DOWNLOAD=1 — voice will use OpenAI API')
+  } else {
+    try {
+      mkdirSync(WHISPER_MODEL_DIR, { recursive: true })
+      // Download to .partial first; rename only on size verification.
+      // Prevents the next run from finding a corrupt file at the final path.
+      execSync(`curl -fL --progress-bar "${WHISPER_MODEL_URL}" -o "${WHISPER_MODEL_PARTIAL}"`, {
+        stdio: 'inherit',
+        timeout: 900000  // 15 min for slow networks
+      })
+      const stats = statSync(WHISPER_MODEL_PARTIAL)
+      if (stats.size < WHISPER_MODEL_MIN_BYTES) {
+        throw new Error(`Downloaded file too small: ${stats.size} bytes (expected >= ${WHISPER_MODEL_MIN_BYTES})`)
+      }
+      // Atomic rename — final path is either valid or doesn't exist
+      renameSync(WHISPER_MODEL_PARTIAL, WHISPER_MODEL_PATH)
+      console.log(green('  \u2713') + ' Model downloaded ' + dim('— voice = local (FREE)'))
+    } catch (err) {
+      // Clean up partial — never leave junk at the final path
+      try { unlinkSync(WHISPER_MODEL_PARTIAL) } catch {}
+      console.log(red('  \u2717') + ' Model download failed ' + dim('— voice will use OpenAI API'))
+      console.log('    ' + dim('Error: ' + (err.message || err).toString().slice(0, 120)))
+      console.log('    ' + dim('Manual: curl -fL ' + WHISPER_MODEL_URL + ' -o ' + WHISPER_MODEL_PATH))
+    }
   }
 } else {
   // No whisper-cli — voice will fall back to OpenAI API
   console.log(yellow('  \u26a0') + ' whisper.cpp not installed ' + dim('— voice will use OpenAI API ($0.006/min)'))
-  console.log('    For free local voice transcription, run:')
-  console.log('    ' + bold('brew install whisper-cpp'))
+  console.log('    For free local voice transcription:')
+  console.log('    macOS: ' + bold('brew install whisper-cpp') + dim('  (no Homebrew? https://brew.sh)'))
+  console.log('    Linux: ' + bold('Build from https://github.com/ggerganov/whisper.cpp'))
   console.log('    ' + dim('Then re-run npx @gotcos/glasses-server to download the model.'))
 }
 
