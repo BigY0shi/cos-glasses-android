@@ -19,6 +19,24 @@ const yellow = (s) => `\x1b[33m${s}\x1b[0m`
 const dim = (s) => `\x1b[2m${s}\x1b[0m`
 const bold = (s) => `\x1b[1m${s}\x1b[0m`
 
+if (process.argv.includes('--help') || process.argv.includes('-h')) {
+  console.log('')
+  console.log(bold('  COS Glasses Server'))
+  console.log('')
+  console.log('  Usage:')
+  console.log('    npx @gotcos/glasses-server')
+  console.log('')
+  console.log('  Requirements:')
+  console.log('    - Node.js 18+')
+  console.log('    - Claude Code CLI for Opus/Sonnet, or Codex CLI for Codex High')
+  console.log('    - Even G2 smart glasses + COS Glasses app')
+  console.log('')
+  console.log('  Setup guide:')
+  console.log('    https://www.gotcos.com/wizard')
+  console.log('')
+  process.exit(0)
+}
+
 console.log('')
 console.log(bold('  COS Glasses Server'))
 console.log(dim('  AI heads-up display for Even G2 smart glasses'))
@@ -33,16 +51,54 @@ if (nodeVersion < 18) {
 }
 console.log(green('  \u2713') + ` Node.js ${process.versions.node}`)
 
-// Step 2: Check Claude CLI
-let claudeVersion = null
-try {
-  claudeVersion = execSync('claude --version', { stdio: 'pipe', timeout: 5000 }).toString().trim()
-  console.log(green('  \u2713') + ` Claude Code ${claudeVersion}`)
-} catch {
-  console.log(red('  \u2717 Claude Code CLI not found'))
-  console.log('')
+// Step 2: Check local agent CLIs. Users need at least one route:
+// Claude Code for Opus/Sonnet, or Codex CLI for Codex High.
+function getCliVersion(command) {
+  try {
+    return execSync(`${command} --version 2>&1`, {
+      shell: '/bin/sh',
+      stdio: 'pipe',
+      timeout: 5000
+    }).toString().trim()
+  } catch {
+    return null
+  }
+}
+
+function normalizeCodexVersion(raw) {
+  if (!raw) return 'available'
+  const line = raw.split('\n').map((s) => s.trim()).find((s) => /^codex(?:-cli)?\s+/i.test(s)) || raw.split('\n')[0].trim()
+  return line.replace(/^codex(?:-cli)?\s*/i, '') || line
+}
+
+const claudeVersion = getCliVersion('claude')
+const codexVersion = getCliVersion('codex')
+
+if (claudeVersion) {
+  console.log(green('  \u2713') + ` Claude Code ${claudeVersion} ` + dim('(Opus/Sonnet ready)'))
+} else {
+  console.log(yellow('  \u26a0') + ' Claude Code CLI not found ' + dim('\u2014 Opus/Sonnet unavailable'))
   console.log('    Install from: ' + bold('https://claude.ai/download'))
-  console.log('    Then run this command again.')
+}
+
+if (codexVersion) {
+  console.log(green('  \u2713') + ` Codex CLI ${normalizeCodexVersion(codexVersion)} ` + dim('(Codex High ready)'))
+} else {
+  console.log(yellow('  \u26a0') + ' Codex CLI not found ' + dim('\u2014 Codex High unavailable'))
+  console.log('    Install from: ' + bold('https://developers.openai.com/codex/'))
+  console.log('    After install: ' + bold('codex login'))
+}
+
+if (!claudeVersion && !codexVersion) {
+  console.log('')
+  console.log(red('  \u2717 No supported agent CLI found'))
+  console.log('')
+  console.log('    Install Claude Code for Opus/Sonnet:')
+  console.log('    ' + bold('https://claude.ai/download'))
+  console.log('')
+  console.log('    Or install Codex CLI for Codex High:')
+  console.log('    ' + bold('https://developers.openai.com/codex/'))
+  console.log('    Then run: ' + bold('codex login'))
   console.log('')
   process.exit(1)
 }
@@ -67,7 +123,8 @@ if (!existsSync(APP_DIR)) {
     process.exit(1)
   }
 } else {
-  // Check for updates (non-blocking, best-effort)
+  // Pull updates automatically so every `npx @gotcos/glasses-server` run
+  // boots the latest stable COS Glasses app (Codex High, HUD polish, fixes).
   try {
     const result = execSync('git fetch --dry-run 2>&1', {
       cwd: APP_DIR,
@@ -75,12 +132,19 @@ if (!existsSync(APP_DIR)) {
       timeout: 10000
     }).toString()
     if (result.trim()) {
-      console.log(yellow('  \u2191') + ' Update available \u2014 run ' + dim('cd ~/.cos-glasses/app && git pull'))
+      console.log(yellow('  \u2191') + ' Update available — pulling latest COS Glasses app...')
+      execSync('git pull --ff-only', {
+        cwd: APP_DIR,
+        stdio: 'pipe',
+        timeout: 120000
+      })
+      console.log(green('  \u2713') + ' App updated')
     } else {
       console.log(green('  \u2713') + ' App up to date')
     }
-  } catch {
+  } catch (err) {
     console.log(green('  \u2713') + ' App installed')
+    console.log('    ' + dim('Update check skipped: ' + (err.message || err).toString().slice(0, 100)))
   }
 }
 
