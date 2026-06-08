@@ -264,9 +264,9 @@ function isExtendedQuery(query: string): boolean {
   return false
 }
 
-// Reserved for future backend run metadata. Empty in the Claude-only MVP server.
 export interface ModelRunMetadata {
-  runId?: string
+  codexRunId?: string
+  codexThreadId?: string
 }
 
 export interface StreamCallbacks {

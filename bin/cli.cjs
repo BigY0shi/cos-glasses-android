@@ -28,10 +28,10 @@ if (process.argv.includes('--help') || process.argv.includes('-h')) {
   console.log('')
   console.log('  Requirements:')
   console.log('    - Node.js 20.11+')
-  console.log('    - Claude Code CLI (Opus / Sonnet / Haiku)')
+  console.log('    - Claude Code CLI (Opus / Sonnet / Haiku) or Codex CLI (Codex High)')
   console.log('    - Even G2 smart glasses + the COS Glasses app (Even Hub)')
   console.log('')
-  console.log('  No API key is needed for chat — it runs through your Claude Code CLI.')
+  console.log('  No API key is needed for chat — it runs through your installed CLI.')
   console.log('  Config persists at ~/.cos-glasses/.env')
   console.log('')
   console.log('  Setup guide: https://www.gotcos.com')
@@ -53,7 +53,7 @@ if (nodeMajor < 20 || (nodeMajor === 20 && nodeMinor < 11)) {
 }
 console.log(green('  ✓') + ` Node.js ${process.versions.node}`)
 
-// Step 2: Claude Code CLI detection (the chat backend)
+// Step 2: agent CLI detection — at least one of Claude Code / Codex is required
 function getCliVersion(command) {
   try {
     return execSync(`${command} --version 2>&1`, { shell: '/bin/sh', stdio: 'pipe', timeout: 5000 }).toString().trim()
@@ -61,13 +61,29 @@ function getCliVersion(command) {
     return null
   }
 }
+function normalizeCodexVersion(raw) {
+  if (!raw) return 'available'
+  const line = raw.split('\n').map((s) => s.trim()).find((s) => /^codex(?:-cli)?\s+/i.test(s)) || raw.split('\n')[0].trim()
+  return line.replace(/^codex(?:-cli)?\s*/i, '') || line
+}
 const claudeVersion = getCliVersion('claude')
+const codexVersion = getCliVersion('codex')
 if (claudeVersion) {
   console.log(green('  ✓') + ` Claude Code ${claudeVersion} ` + dim('(Opus / Sonnet / Haiku)'))
 } else {
+  console.log(yellow('  ⚠') + ' Claude Code CLI not found ' + dim('— Opus/Sonnet/Haiku unavailable'))
+  console.log('    Install: ' + bold('https://claude.ai/download'))
+}
+if (codexVersion) {
+  console.log(green('  ✓') + ` Codex CLI ${normalizeCodexVersion(codexVersion)} ` + dim('(Codex High)'))
+} else {
+  console.log(yellow('  ⚠') + ' Codex CLI not found ' + dim('— Codex High unavailable'))
+}
+if (!claudeVersion && !codexVersion) {
   console.log('')
-  console.log(red('  ✗ Claude Code CLI not found') + ' — required for chat')
-  console.log('    Install: ' + bold('https://claude.ai/download') + ' then ' + bold('claude login'))
+  console.log(red('  ✗ No supported agent CLI found'))
+  console.log('    Install Claude Code: ' + bold('https://claude.ai/download'))
+  console.log('    or Codex CLI:        ' + bold('https://developers.openai.com/codex/') + ' then ' + bold('codex login'))
   console.log('')
   process.exit(1)
 }

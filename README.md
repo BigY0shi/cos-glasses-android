@@ -19,12 +19,15 @@ an **API token** — paste that into the COS Glasses app.
 
 - **Node.js 20.11+** — https://nodejs.org
 - **Claude Code CLI** (Opus/Sonnet/Haiku) — https://claude.ai/download, then `claude login`
+  _or_ **Codex CLI** (Codex High) — https://developers.openai.com/codex/, then `codex login`
 - **Even G2 glasses** + the **COS Glasses** app from the Even Hub
 - _Optional:_ `brew install whisper-cpp` for free local voice (otherwise OpenAI API)
 - _Optional:_ **Tailscale** so your phone reaches your Mac from anywhere
 
-> No `ANTHROPIC_API_KEY` is needed — chat runs through your installed Claude Code
-> CLI, billed to your existing Claude subscription.
+> No `ANTHROPIC_API_KEY` is needed — chat runs through your installed CLI, billed
+> to your existing Claude or Codex subscription. Pick either per query, or set a
+> default with `COS_G2_DEFAULT_MODEL` (`opus`|`sonnet`|`haiku`|`codex-high`).
+> Codex runs **sandboxed read-only** by default (`COS_CODEX_SANDBOX` to adjust).
 
 ## Connect your phone (the one gotcha)
 
@@ -67,7 +70,7 @@ BIND_HOST=0.0.0.0 npm run start:server
 ## Troubleshooting
 
 - *Phone can't connect* — check `BIND_HOST=0.0.0.0`, the same Tailscale account on both devices, and the correct `100.x` IP + token.
-- *AI queries fail* — run `claude --version`, then `claude login`.
+- *AI queries fail* — run `claude --version` / `codex --version`, then `claude login` / `codex login`.
 - *Voice getting billed?* — install `whisper-cpp` for free local transcription.
 
 ## License

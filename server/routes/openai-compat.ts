@@ -71,13 +71,14 @@ function validateAuth(req: any, res: any): boolean {
 }
 
 // Resolve model from OpenAI-compatible model ids. Defaults to Haiku for
-// "Hey Even" speed; Opus/Sonnet/Haiku can be explicitly selected.
+// "Hey Even" speed; Opus/Sonnet/Haiku/Codex High can be explicitly selected.
 function resolveModel(model?: string, _query?: string): ModelPreference {
   const normalized = normalizeModelPreference(model)
   if (normalized) return normalized
   if (model === 'cos-opus') return 'opus'
   if (model === 'cos-sonnet') return 'sonnet'
   if (model === 'cos-haiku') return 'haiku'
+  if (model === 'cos-codex-high' || model === 'cos-codex') return 'codex-high'
   return normalizeModelPreference(process.env.COS_G2_DEFAULT_MODEL) ?? 'haiku'
 }
 
@@ -85,6 +86,7 @@ const MODEL_NAMES: Record<ModelPreference, string> = {
   opus: 'cos-opus',
   sonnet: 'cos-sonnet',
   haiku: 'cos-haiku',
+  'codex-high': 'cos-codex-high',
 }
 
 // Extract the user's latest message from the OpenAI messages array
@@ -438,6 +440,7 @@ openaiCompatRouter.get('/v1/models', (_req, res) => {
 	      { id: 'cos-opus', object: 'model', created: 1709251200, owned_by: 'cos' },
 	      { id: 'cos-sonnet', object: 'model', created: 1709251200, owned_by: 'cos' },
 	      { id: 'cos-haiku', object: 'model', created: 1709251200, owned_by: 'cos' },
+	      { id: 'cos-codex-high', object: 'model', created: 1709251200, owned_by: 'cos' },
 	    ],
 	  })
 	})

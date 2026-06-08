@@ -19,12 +19,14 @@ healthRouter.get('/health', async (_req, res) => {
     server: 'ok',
     python: 'unknown',
     claude: 'unknown',
+    codex: 'unknown',
     uptime_seconds: Math.floor((Date.now() - serverMetrics.startedAt) / 1000),
     request_count: serverMetrics.requestCount,
   }
 
   // Feature detection flags
   let claudeAvailable = false
+  let codexAvailable = false
 
   // Check Python venv (COS mode only)
   if (PYTHON_BIN) {
@@ -57,6 +59,23 @@ healthRouter.get('/health', async (_req, res) => {
     checks.claude = 'error'
   }
 
+  // Check Codex CLI. The desktop CLI can print benign PATH warnings to stderr,
+  // so version extraction uses stdout + stderr and looks for the codex-cli line.
+  try {
+    await new Promise<void>((resolve, reject) => {
+      execFile('codex', ['--version'], { timeout: 5000 }, (err, stdout, stderr) => {
+        if (err) return reject(err)
+        const combined = `${stdout}\n${stderr}`.trim()
+        const versionLine = combined.split('\n').map(line => line.trim()).find(line => /^codex(?:-cli)?\s+/i.test(line))
+        checks.codex = versionLine ?? combined.split('\n')[0] ?? 'available'
+        codexAvailable = true
+        resolve()
+      })
+    })
+  } catch {
+    checks.codex = 'error'
+  }
+
   // Check session cache freshness (COS mode only)
   if (COS_SCRIPTS_DIR) {
     try {
@@ -82,6 +101,7 @@ healthRouter.get('/health', async (_req, res) => {
   const keyStatus = getKeyStatus()
   const features = {
     claude: claudeAvailable,
+    codex: codexAvailable,
     voice: keyStatus.hasKey,
     cos_pipeline: COS_MODE,
     whisper: isWhisperLocalAvailable(),

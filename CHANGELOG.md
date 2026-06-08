@@ -1,5 +1,13 @@
 # Changelog
 
+## 6.1.0
+
+- **Codex backend.** Chat now routes to your local **Codex CLI** (`codex-high`) in
+  addition to Claude Code — pick either per query, or set `COS_G2_DEFAULT_MODEL`.
+- The Codex model is **not** hardcoded — it uses your codex CLI's own default model
+  unless you pin one with `COS_CODEX_MODEL` (+ optional `COS_CODEX_REASONING_EFFORT`).
+- Codex run/session state persists under `~/.cos-glasses/data`.
+
 ## 6.0.0
 
 The server now ships **inside** this package — `npx @gotcos/glasses-server` runs

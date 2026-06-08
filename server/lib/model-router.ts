@@ -1,4 +1,5 @@
 import { callClaudeStreaming, type CallOptions, type StreamCallbacks } from './claude-bridge.js'
+import { callCodexStreaming } from './codex-bridge.js'
 import {
   getOrCreateSession,
   getSessionModel,
@@ -6,10 +7,11 @@ import {
   type ModelPreference,
   type PromptReference,
 } from './conversation.js'
-import { DEFAULT_MODEL, isClaudeModel, normalizeModelPreference } from '../../shared/model-preference.js'
+import { DEFAULT_MODEL, isCodexModel, isClaudeModel, normalizeModelPreference } from '../../shared/model-preference.js'
 
-// MVP server: the local Claude Code CLI is the only chat backend. Any unknown
-// model preference is clamped to the Claude default so chat always works.
+// Chat routes to the user's local Claude Code CLI (opus/sonnet/haiku) or the
+// Codex CLI (codex-high). Any unknown preference falls back to the Claude default
+// so chat always works on a stock install.
 export async function callModelStreaming(
   query: string,
   sessionId: string | undefined,
@@ -22,10 +24,15 @@ export async function callModelStreaming(
 ): Promise<string> {
   const sid = getOrCreateSession(sessionId)
   const sessionModel = getSessionModel(sid)
-  const requested = normalizeModelPreference(model) ?? sessionModel ?? DEFAULT_MODEL
-  const resolvedModel = isClaudeModel(requested) ? requested : DEFAULT_MODEL
+  const resolvedModel = normalizeModelPreference(model) ?? sessionModel ?? DEFAULT_MODEL
 
   setSessionModel(sid, resolvedModel)
 
-  return callClaudeStreaming(query, sid, callbacks, resolvedModel, images, reference, globalMsgNum, options)
+  if (isCodexModel(resolvedModel)) {
+    return callCodexStreaming(query, sid, callbacks, resolvedModel, images, reference, globalMsgNum, options)
+  }
+  if (isClaudeModel(resolvedModel)) {
+    return callClaudeStreaming(query, sid, callbacks, resolvedModel, images, reference, globalMsgNum, options)
+  }
+  return callClaudeStreaming(query, sid, callbacks, DEFAULT_MODEL, images, reference, globalMsgNum, options)
 }
