@@ -1,0 +1,578 @@
+// Speaker embedding extraction and verification using sherpa-onnx
+// Wraps ECAPA-TDNN model for voiceprint-based speaker classification.
+// Falls back gracefully if model is missing — amplitude classification continues.
+//
+// Phase 1: Auto-enrollment — high-confidence matches add G2-mic embeddings
+// Phase 4: Calendar priming — scoped search to expected meeting attendees
+
+import { resolve } from 'node:path'
+import { errMsg } from './utils.js'
+import { getOwnerSpeakerLabel } from './profile.js'
+import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+
+// sherpa-onnx-node is CJS — use createRequire for ESM compat
+import { createRequire } from 'node:module'
+const require = createRequire(import.meta.url)
+
+const __dirname = fileURLToPath(new URL('.', import.meta.url))
+
+const MODEL_PATH = resolve(__dirname, '..', 'models',
+  '3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx')
+import { DATA_DIR } from './data-dir.js'
+const PROFILES_PATH = resolve(DATA_DIR, 'voice-profiles.json')
+const CALIBRATION_LOG = resolve(DATA_DIR, 'speaker-calibration.jsonl')
+
+// Thresholds
+const VERIFY_THRESHOLD = 0.65
+const SEARCH_THRESHOLD = 0.55
+const AUTO_ENROLL_THRESHOLD = 0.88    // High bar — must be very confident before auto-enrolling
+const AUTO_ENROLL_CONSENSUS = 2       // Must match N times in same session before enrolling
+const MAX_EMBEDDINGS_PER_SPEAKER = 20 // FIFO cap — oldest drops when full
+const SAMPLE_RATE = 16000
+
+// Module-level state — sherpa-onnx-node is CJS with no TS types (SDK v0.0.7 interop)
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let extractor: any = null
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let manager: any = null
+let initialized = false
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let sherpaOnnx: any = null
+
+// In-memory profile store cache — avoids re-reading 7MB+ JSON on every audio chunk
+let _cachedProfileStore: ProfileStore | null = null
+
+// Auto-enrollment session tracking: sessionId → { speakerName → matchCount }
+const autoEnrollSessions = new Map<string, Map<string, number>>()
+// Track which speakers already auto-enrolled this session
+const autoEnrolledThisSession = new Map<string, Set<string>>()
+
+interface VoiceProfile {
+  name: string
+  embeddings: number[][]  // multiple enrollments for robustness
+  sources?: string[]      // provenance: 'manual' | 'fireflies' | 'auto:sessionId'
+}
+
+interface ProfileStore {
+  profiles: VoiceProfile[]
+}
+
+/** Initialize speaker embedding system. Returns false if model missing (graceful degradation). */
+export function initSpeakerEmbeddings(): boolean {
+  if (initialized) return extractor !== null
+
+  initialized = true
+
+  if (!existsSync(MODEL_PATH)) {
+    console.log('[speaker] Model not found at', MODEL_PATH, '— embedding disabled, using amplitude fallback')
+    return false
+  }
+
+  try {
+    sherpaOnnx = require('sherpa-onnx-node')
+
+    extractor = new sherpaOnnx.SpeakerEmbeddingExtractor({
+      model: MODEL_PATH,
+      numThreads: 2,
+      provider: 'cpu',
+    })
+
+    manager = new sherpaOnnx.SpeakerEmbeddingManager(extractor.dim)
+    console.log(`[speaker] Initialized: ${extractor.dim}-dim embeddings`)
+
+    // Ensure data directory exists
+    if (!existsSync(DATA_DIR)) {
+      mkdirSync(DATA_DIR, { recursive: true })
+    }
+
+    // Load persisted profiles
+    loadProfiles()
+
+    return true
+  } catch (err: unknown) {
+    console.error('[speaker] Init failed:', errMsg(err))
+    extractor = null
+    manager = null
+    return false
+  }
+}
+
+/** Check if a speaker is enrolled */
+export function isEnrolled(name: string): boolean {
+  if (!manager) return false
+  return manager.contains(name)
+}
+
+/** Get all enrolled speaker names */
+export function getAllSpeakerNames(): string[] {
+  if (!manager) return []
+  return manager.getAllSpeakerNames()
+}
+
+/** Enroll a speaker from WAV audio buffer */
+export function enrollSpeaker(name: string, wavBuffer: Buffer): { success: boolean; dim: number; error?: string } {
+  if (!extractor || !manager) {
+    return { success: false, dim: 0, error: 'Speaker embeddings not initialized' }
+  }
+
+  try {
+    const embedding = extractEmbeddingFromWav(wavBuffer)
+    if (!embedding) {
+      return { success: false, dim: 0, error: 'Could not extract embedding — audio too short or silent' }
+    }
+
+    return enrollEmbedding(name, embedding, 'manual')
+  } catch (err: unknown) {
+    console.error('[speaker] Enrollment error:', errMsg(err))
+    return { success: false, dim: 0, error: errMsg(err) }
+  }
+}
+
+/** Enroll a raw embedding directly (used by trainer and auto-enroll).
+ *  skipDedupCheck: when true, bypass the 0.95 similarity dedup gate.
+ *  The trainer's greedy diversity selector already ensures embeddings are diverse,
+ *  so the dedup gate is redundant and too restrictive for batch training
+ *  (Fireflies audio conditions are uniform enough that even "most diverse"
+ *  embeddings can exceed 0.95 similarity). */
+export function enrollEmbedding(name: string, embedding: Float32Array, source: string = 'manual', skipDedupCheck: boolean = false): { success: boolean; dim: number; error?: string } {
+  if (!extractor || !manager) {
+    return { success: false, dim: 0, error: 'Speaker embeddings not initialized' }
+  }
+
+  // Check diversity: skip if too similar to an existing embedding for this speaker
+  const store = loadProfileStore()
+  const profile = store.profiles.find(p => p.name === name)
+  if (profile) {
+    // Dedup check: skip if too similar to existing (unless bypassed by trainer)
+    if (!skipDedupCheck) {
+      for (const existing of profile.embeddings) {
+        const sim = rawCosineSimilarity(embedding, new Float32Array(existing))
+        if (sim > 0.95) {
+          return { success: false, dim: extractor.dim, error: 'Too similar to existing embedding (>0.95)' }
+        }
+      }
+    }
+
+    // FIFO cap: if at max, drop oldest before adding (always enforced)
+    if (profile.embeddings.length >= MAX_EMBEDDINGS_PER_SPEAKER) {
+      console.log(`[speaker] Profile cap reached for "${name}" (${profile.embeddings.length}/${MAX_EMBEDDINGS_PER_SPEAKER}) — dropping oldest`)
+      profile.embeddings.shift()
+      profile.sources?.shift()
+      rebuildSpeakerInManager(name, profile.embeddings)
+    }
+  }
+
+  // Add to manager — if manager rejects (internal dedup), force via remove+readd
+  let added = manager.add({ name, v: embedding })
+  if (!added) {
+    // Manager's internal dedup rejected it — force-add by rebuilding
+    // Persist first so we have the complete embedding list
+    persistProfile(name, embedding, source)
+    const updatedStore = loadProfileStore()
+    const updatedProfile = updatedStore.profiles.find(p => p.name === name)
+    if (updatedProfile) {
+      rebuildSpeakerInManager(name, updatedProfile.embeddings)
+      console.log(`[speaker] Force-enrolled "${name}" via rebuild (${updatedProfile.embeddings.length} total, source: ${source})`)
+      return { success: true, dim: extractor.dim }
+    }
+    return { success: false, dim: extractor.dim, error: 'Manager rejected and rebuild failed' }
+  }
+
+  // Persist to disk with provenance
+  persistProfile(name, embedding, source)
+
+  console.log(`[speaker] Enrolled "${name}" (${extractor.dim}-dim, source: ${source})`)
+  return { success: true, dim: extractor.dim }
+}
+
+/** Identify speaker from WAV audio buffer.
+ *  Phase 4: optionally scope search to expected attendees for fewer false positives. */
+export function identifySpeaker(
+  wavBuffer: Buffer,
+  expectedSpeakers?: string[],
+): { speaker: string; similarity: number } | null {
+  if (!extractor || !manager) return null
+
+  try {
+    const embedding = extractEmbeddingFromWav(wavBuffer)
+    if (!embedding) return null
+
+    // If the wearer is enrolled, verify against them first (they're wearing the glasses)
+    const owner = getOwnerSpeakerLabel()
+    if (manager.contains(owner)) {
+      const isOwner = manager.verify({ name: owner, v: embedding, threshold: VERIFY_THRESHOLD })
+      if (isOwner) {
+        const similarity = computeCosineSimilarity(embedding, owner)
+        logCalibration(owner, similarity, true)
+        return { speaker: owner, similarity }
+      }
+    }
+
+    // Phase 4: scoped search — try expected attendees first
+    if (expectedSpeakers && expectedSpeakers.length > 0) {
+      for (const name of expectedSpeakers) {
+        if (name === owner) continue // wearer already checked
+        if (!manager.contains(name)) continue
+        const matches = manager.verify({ name, v: embedding, threshold: SEARCH_THRESHOLD })
+        if (matches) {
+          const similarity = computeCosineSimilarity(embedding, name)
+          logCalibration(name, similarity, true)
+          return { speaker: name, similarity }
+        }
+      }
+    }
+
+    // Full search across all speakers (fallback or no expected speakers)
+    const found = manager.search({ v: embedding, threshold: SEARCH_THRESHOLD })
+    if (found && found.length > 0) {
+      const similarity = computeCosineSimilarity(embedding, found)
+      logCalibration(found, similarity, true)
+      return { speaker: found, similarity }
+    }
+
+    // No match — external speaker
+    logCalibration('Ext', 0, false)
+    return { speaker: 'Ext', similarity: 0 }
+  } catch (err: unknown) {
+    console.error('[speaker] Identification error:', errMsg(err))
+    return null
+  }
+}
+
+/** Auto-enroll from a high-confidence match during live meetings.
+ *  Requires consensus: N matches above threshold in the same session before enrolling.
+ *  Rate limited: max 1 auto-enrollment per speaker per session. */
+export function autoEnroll(
+  name: string,
+  wavBuffer: Buffer,
+  similarity: number,
+  sessionId: string,
+): { enrolled: boolean; reason: string } {
+  if (!extractor || !manager) return { enrolled: false, reason: 'not initialized' }
+  if (name === getOwnerSpeakerLabel() || name === 'Ext') return { enrolled: false, reason: 'skip owner/Ext' }
+  if (similarity < AUTO_ENROLL_THRESHOLD) return { enrolled: false, reason: `similarity ${similarity.toFixed(3)} < ${AUTO_ENROLL_THRESHOLD}` }
+
+  // Check if already auto-enrolled this session
+  if (!autoEnrolledThisSession.has(sessionId)) {
+    autoEnrolledThisSession.set(sessionId, new Set())
+  }
+  if (autoEnrolledThisSession.get(sessionId)!.has(name)) {
+    return { enrolled: false, reason: 'already enrolled this session' }
+  }
+
+  // Consensus gate: track match count per speaker per session
+  if (!autoEnrollSessions.has(sessionId)) {
+    autoEnrollSessions.set(sessionId, new Map())
+  }
+  const sessionCounts = autoEnrollSessions.get(sessionId)!
+  const count = (sessionCounts.get(name) ?? 0) + 1
+  sessionCounts.set(name, count)
+
+  if (count < AUTO_ENROLL_CONSENSUS) {
+    return { enrolled: false, reason: `consensus ${count}/${AUTO_ENROLL_CONSENSUS}` }
+  }
+
+  // Extract embedding and enroll
+  const embedding = extractEmbeddingFromWav(wavBuffer)
+  if (!embedding) return { enrolled: false, reason: 'extraction failed' }
+
+  const result = enrollEmbedding(name, embedding, `auto:${sessionId}`)
+  if (result.success) {
+    autoEnrolledThisSession.get(sessionId)!.add(name)
+    logCalibration(name, similarity, true, 'auto-enrolled')
+    console.log(`[speaker] Auto-enrolled "${name}" (sim: ${similarity.toFixed(3)}, session: ${sessionId})`)
+    return { enrolled: true, reason: 'success' }
+  }
+
+  return { enrolled: false, reason: result.error ?? 'enrollment failed' }
+}
+
+/** Clear auto-enrollment session state (call when meeting ends) */
+export function clearAutoEnrollSession(sessionId: string): void {
+  autoEnrollSessions.delete(sessionId)
+  autoEnrolledThisSession.delete(sessionId)
+}
+
+/** Clear all embeddings for a speaker (used by fresh training mode) */
+export function clearSpeakerEmbeddings(name: string): boolean {
+  const store = loadProfileStore()
+  const profile = store.profiles.find(p => p.name === name)
+  if (!profile || profile.embeddings.length === 0) return false
+
+  console.log(`[speaker] Clearing ${profile.embeddings.length} embeddings for "${name}"`)
+  profile.embeddings = []
+  profile.sources = []
+
+  // Remove from manager
+  if (manager && manager.contains(name)) {
+    try { manager.remove(name) } catch { /* ignore */ }
+  }
+
+  // Persist
+  writeFileSync(PROFILES_PATH, JSON.stringify(store, null, 2))
+  invalidateProfileCache()
+  return true
+}
+
+/** Get embedding count for a speaker */
+export function getEmbeddingCount(name: string): number {
+  const store = loadProfileStore()
+  const profile = store.profiles.find(p => p.name === name)
+  return profile?.embeddings.length ?? 0
+}
+
+/** Extract raw embedding from WAV buffer */
+export function extractEmbedding(wavBuffer: Buffer): Float32Array | null {
+  return extractEmbeddingFromWav(wavBuffer)
+}
+
+/** Check if the embedding system is available */
+export function isEmbeddingAvailable(): boolean {
+  return extractor !== null && manager !== null
+}
+
+/** Compute actual cosine similarity between two raw embedding vectors */
+export function rawCosineSimilarity(a: Float32Array, b: Float32Array): number {
+  if (a.length !== b.length) return 0
+  let dot = 0, normA = 0, normB = 0
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i]
+    normA += a[i] * a[i]
+    normB += b[i] * b[i]
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB)
+  return denom > 0 ? dot / denom : 0
+}
+
+// ── Internal helpers ───────────────────────────────────────────
+
+function extractEmbeddingFromWav(wavBuffer: Buffer): Float32Array | null {
+  if (!extractor) return null
+
+  try {
+    // Parse WAV header to get to PCM data
+    const samples = wavBufferToFloat32(wavBuffer)
+    if (!samples || samples.length < SAMPLE_RATE * 0.5) {
+      // Need at least 0.5s of audio
+      return null
+    }
+
+    const stream = extractor.createStream()
+    stream.acceptWaveform({ samples, sampleRate: SAMPLE_RATE })
+    stream.inputFinished()
+
+    if (!extractor.isReady(stream)) {
+      return null
+    }
+
+    return extractor.compute(stream)
+  } catch (err: unknown) {
+    console.error('[speaker] Embedding extraction error:', errMsg(err))
+    return null
+  }
+}
+
+/** Convert WAV buffer (16-bit PCM) to Float32Array normalized to [-1, 1] */
+function wavBufferToFloat32(wavBuffer: Buffer): Float32Array | null {
+  // WAV header is 44 bytes for standard PCM
+  if (wavBuffer.length < 44) return null
+
+  // Verify RIFF header
+  const riff = wavBuffer.toString('ascii', 0, 4)
+  if (riff !== 'RIFF') return null
+
+  // Find data chunk offset — standard WAV has data at offset 44,
+  // but some encoders add extra chunks. Search for 'data' marker.
+  let dataOffset = 12
+  while (dataOffset < wavBuffer.length - 8) {
+    const chunkId = wavBuffer.toString('ascii', dataOffset, dataOffset + 4)
+    const chunkSize = wavBuffer.readUInt32LE(dataOffset + 4)
+    if (chunkId === 'data') {
+      dataOffset += 8
+      break
+    }
+    dataOffset += 8 + chunkSize
+  }
+
+  if (dataOffset >= wavBuffer.length) return null
+
+  const pcmData = wavBuffer.subarray(dataOffset)
+  const numSamples = Math.floor(pcmData.length / 2)
+  const float32 = new Float32Array(numSamples)
+
+  for (let i = 0; i < numSamples; i++) {
+    const sample = pcmData.readInt16LE(i * 2)
+    float32[i] = sample / 32768.0
+  }
+
+  return float32
+}
+
+/** Compute cosine similarity between an embedding and a stored speaker (approximate via binary search) */
+function computeCosineSimilarity(_embedding: Float32Array, _name: string): number {
+  // The sherpa-onnx manager doesn't expose raw stored embeddings,
+  // so we use verify with decreasing thresholds to estimate similarity
+  if (!manager) return 0
+
+  // Binary search for similarity threshold
+  let lo = 0, hi = 1
+  for (let i = 0; i < 10; i++) {
+    const mid = (lo + hi) / 2
+    const matches = manager.verify({ name: _name, v: _embedding, threshold: mid })
+    if (matches) {
+      lo = mid
+    } else {
+      hi = mid
+    }
+  }
+  return (lo + hi) / 2
+}
+
+/** Log calibration data for threshold tuning */
+function logCalibration(speaker: string, similarity: number, matched: boolean, event?: string): void {
+  try {
+    const entry: Record<string, string | number | boolean> = {
+      ts: new Date().toISOString(),
+      speaker,
+      similarity: Math.round(similarity * 1000) / 1000,
+      matched,
+    }
+    if (event) entry.event = event
+    appendFileSync(CALIBRATION_LOG, JSON.stringify(entry) + '\n')
+  } catch { /* non-critical */ }
+}
+
+/** Load profile store from disk (cached in memory, invalidated on write) */
+function loadProfileStore(): ProfileStore {
+  if (_cachedProfileStore) return _cachedProfileStore
+  if (existsSync(PROFILES_PATH)) {
+    _cachedProfileStore = JSON.parse(readFileSync(PROFILES_PATH, 'utf-8'))
+    return _cachedProfileStore!
+  }
+  return { profiles: [] }
+}
+
+/** Invalidate the in-memory profile store cache (call after any write to PROFILES_PATH) */
+function invalidateProfileCache(): void {
+  _cachedProfileStore = null
+}
+
+/** Persist a speaker profile to disk with provenance tracking */
+function persistProfile(name: string, embedding: Float32Array, source: string = 'manual'): void {
+  try {
+    const store = loadProfileStore()
+
+    let profile = store.profiles.find(p => p.name === name)
+    if (!profile) {
+      profile = { name, embeddings: [], sources: [] }
+      store.profiles.push(profile)
+    }
+    if (!profile.sources) profile.sources = []
+    profile.embeddings.push(Array.from(embedding))
+    profile.sources.push(source)
+
+    writeFileSync(PROFILES_PATH, JSON.stringify(store, null, 2))
+    invalidateProfileCache()
+  } catch (err: unknown) {
+    console.error('[speaker] Profile persist error:', errMsg(err))
+  }
+}
+
+/** Compute centroid (average) of multiple embeddings.
+ *  The centroid captures the speaker's average voice across different acoustic
+ *  conditions (meetings, mics, energy levels). More robust than any single embedding. */
+function computeCentroid(embeddings: number[][]): Float32Array {
+  const dim = embeddings[0].length
+  const centroid = new Float32Array(dim)
+  for (const emb of embeddings) {
+    for (let i = 0; i < dim; i++) {
+      centroid[i] += emb[i]
+    }
+  }
+  // Average
+  for (let i = 0; i < dim; i++) {
+    centroid[i] /= embeddings.length
+  }
+  // L2 normalize (important for cosine similarity)
+  let norm = 0
+  for (let i = 0; i < dim; i++) norm += centroid[i] * centroid[i]
+  norm = Math.sqrt(norm)
+  if (norm > 0) {
+    for (let i = 0; i < dim; i++) centroid[i] /= norm
+  }
+  return centroid
+}
+
+/** Rebuild a speaker in the manager using the centroid of all stored embeddings.
+ *  The sherpa-onnx manager only supports 1 embedding per speaker name —
+ *  add() returns false for duplicates. So we compute a centroid from all
+ *  diverse embeddings and register that single representative vector. */
+function rebuildSpeakerInManager(name: string, embeddings: number[][]): void {
+  if (!manager) return
+  try {
+    // Remove existing entry
+    if (manager.contains(name)) {
+      manager.remove(name)
+    }
+    if (embeddings.length === 0) return
+
+    // Register centroid of all embeddings
+    const centroid = computeCentroid(embeddings)
+    const added = manager.add({ name, v: centroid })
+    if (added) {
+      console.log(`[speaker] Registered centroid for "${name}" (${embeddings.length} source embeddings)`)
+    } else {
+      console.error(`[speaker] Failed to register centroid for "${name}"`)
+    }
+  } catch (err: unknown) {
+    console.error(`[speaker] Rebuild failed for "${name}":`, errMsg(err))
+  }
+}
+
+/** Save full profile store to disk (used by trainer for bulk updates) */
+export function saveProfileStore(store: ProfileStore): void {
+  writeFileSync(PROFILES_PATH, JSON.stringify(store, null, 2))
+  invalidateProfileCache()
+}
+
+/** Rebuild all profiles in manager from a store (used after bulk training) */
+export function rebuildAllProfiles(store: ProfileStore): void {
+  if (!manager) return
+  // Clear manager completely
+  for (const name of getAllSpeakerNames()) {
+    try { manager.remove(name) } catch { /* ignore */ }
+  }
+  // Re-add using centroids
+  let loaded = 0
+  for (const profile of store.profiles) {
+    if (profile.embeddings.length === 0) continue
+    rebuildSpeakerInManager(profile.name, profile.embeddings)
+    loaded++
+  }
+  console.log(`[speaker] Rebuilt manager: ${loaded} speakers (centroid mode)`)
+}
+
+/** Load persisted profiles into manager */
+function loadProfiles(): void {
+  if (!manager || !existsSync(PROFILES_PATH)) return
+
+  try {
+    const store: ProfileStore = JSON.parse(readFileSync(PROFILES_PATH, 'utf-8'))
+    let loaded = 0
+
+    for (const profile of store.profiles) {
+      if (profile.embeddings.length === 0) continue
+      // Register centroid — manager only supports 1 embedding per speaker
+      rebuildSpeakerInManager(profile.name, profile.embeddings)
+      loaded++
+    }
+
+    if (loaded > 0) {
+      const names = manager.getAllSpeakerNames()
+      console.log(`[speaker] Loaded ${loaded} speakers (centroid mode): ${names.join(', ')}`)
+    }
+  } catch (err: unknown) {
+    console.error('[speaker] Profile load error:', errMsg(err))
+  }
+}

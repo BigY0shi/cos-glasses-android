@@ -1,0 +1,7 @@
+{
+  "owner_name": "Your Name",
+  "owner_speaker_label": "Me",
+  "vocabulary": ["NameOne", "NameTwo", "YourCompany", "ProductName"],
+  "whisper_corrections": "{\"Soundalike\": \"YourName\"}",
+  "negative_rules": []
+}

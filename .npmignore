@@ -1,0 +1,11 @@
+# Runtime state — never ship in the tarball
+server/data/
+server/certs/
+server/models/
+
+# Dev-only
+tsconfig.json
+.gitignore
+.cos-profile.json
+.env
+**/*.test.ts

@@ -1,44 +1,75 @@
-# @gotcos/glasses-server
+# COS Glasses Server
 
-COS Glasses — AI heads-up display for Even G2 smart glasses, powered by Claude Code or Codex CLI.
+Self-hosted AI heads-up display for **Even G2 smart glasses**. Runs on your Mac,
+talks to your local **Claude Code** CLI, and pushes answers, voice
+transcription, and notes to the lens. Your data never leaves your machine, and no
+API key is pasted into the phone for chat.
 
-Voice transcription runs **locally on your Mac via whisper.cpp** by default — zero per-minute cost. OpenAI API is only used as a fallback if `whisper-cpp` isn't installed.
-
-## Quick Start
+## Quick start
 
 ```bash
-# Install local Whisper for free voice (one-time, ~3.1GB model auto-downloaded)
-brew install whisper-cpp
-
-# Start the server
 npx @gotcos/glasses-server
 ```
 
-The launcher detects whisper.cpp on first run and downloads the model automatically. If you skip the brew install, voice transcription falls back to OpenAI API ($0.006/min) — set `OPENAI_API_KEY` if you prefer cloud.
+The launcher checks Node, finds your CLI, downloads the local voice model, writes
+`~/.cos-glasses/.env`, and starts the server on `0.0.0.0:3141`. On boot it prints
+an **API token** — paste that into the COS Glasses app.
 
-## Prerequisites
+## Requirements
 
-- macOS (Apple Silicon or Intel)
-- Node.js 18+
-- [Claude Code CLI](https://claude.ai/download) for Opus/Sonnet, or [Codex CLI](https://developers.openai.com/codex/) for Codex High
-- (optional) [whisper.cpp](https://github.com/ggerganov/whisper.cpp) — `brew install whisper-cpp` for free local voice
+- **Node.js 20.11+** — https://nodejs.org
+- **Claude Code CLI** (Opus/Sonnet/Haiku) — https://claude.ai/download, then `claude login`
+- **Even G2 glasses** + the **COS Glasses** app from the Even Hub
+- _Optional:_ `brew install whisper-cpp` for free local voice (otherwise OpenAI API)
+- _Optional:_ **Tailscale** so your phone reaches your Mac from anywhere
 
-For Codex High, install Codex on the same Mac that runs the server, then run:
+> No `ANTHROPIC_API_KEY` is needed — chat runs through your installed Claude Code
+> CLI, billed to your existing Claude subscription.
+
+## Connect your phone (the one gotcha)
+
+The glasses app runs on your iPhone and must reach this server on your Mac.
+
+1. The launcher binds `0.0.0.0` (all interfaces) for you.
+2. **Same WiFi (simplest):** find your Mac's LAN IP (System Settings > Wi-Fi > Details), and in the COS Glasses app enter `http://192.168.x.x:3141`.
+3. **From anywhere:** install **Tailscale** on the Mac + iPhone (same account), note the Mac's `100.x` address, and enter `http://100.x.x.x:3141`.
+4. Either way, paste the **API token** the server printed at boot.
+
+To restrict the server to localhost only, set `BIND_HOST=127.0.0.1` in `~/.cos-glasses/.env`.
+The built-in IP allowlist blocks public-internet traffic regardless.
+
+## What it does
+
+- Ask anything, get a streamed answer on the lens (`/api/query`, `/v1/chat/completions`)
+- Live voice capture + transcription during meetings
+- Local whisper.cpp transcription (free) with OpenAI fallback (optional)
+- Tasks / calendar / people context **if** you run the
+  [COS Starter Kit](https://www.gotcos.com) (`COS_SCRIPTS_DIR`); otherwise it is
+  glasses + AI only
+
+## Configuration
+
+Config lives at `~/.cos-glasses/.env` (created on first run). Every key is
+optional except an installed CLI. Highlights: `BIND_HOST`, `PORT`,
+`COS_API_TOKEN` (auto if unset), `OPENAI_API_KEY` (cloud voice fallback),
+`COS_SCRIPTS_DIR` (full pipeline). Your name + transcription vocabulary live in
+`~/.cos-glasses/.cos-profile.json` (see `.cos-profile.example.json`).
+
+## Run from source
 
 ```bash
-codex login
-codex --version
+git clone https://github.com/ukaoma/cos-glasses-server.git
+cd cos-glasses-server
+npm install
+BIND_HOST=0.0.0.0 npm run start:server
 ```
 
-## Documentation
+## Troubleshooting
 
-Full setup guide and configuration: [gotcos.com/wizard](https://gotcos.com/wizard)
+- *Phone can't connect* — check `BIND_HOST=0.0.0.0`, the same Tailscale account on both devices, and the correct `100.x` IP + token.
+- *AI queries fail* — run `claude --version`, then `claude login`.
+- *Voice getting billed?* — install `whisper-cpp` for free local transcription.
 
-## What you get
+## License
 
-- 100% local LLM queries via Claude Code or Codex CLI — no API key pasted into the phone for chat
-- Opus/Sonnet routes through Claude Code; Codex High routes through local Codex CLI auth
-- Local voice transcription via whisper.cpp (free) with OpenAI API fallback (paid, optional)
-- Live meeting capture + transcription on Even G2 smart glasses
-- Active-meeting recovery — orphaned sessions survive client crashes and can be finalized via `/api/meeting/save`
-- Server-side hallucination filters (Whisper "thank you" pattern) baked in
+MIT. Learn more at [gotcos.com](https://www.gotcos.com).

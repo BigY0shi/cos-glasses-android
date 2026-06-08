@@ -1,0 +1,20 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
+
+# Runtime state (created on first run)
+server/data/
+server/certs/
+server/models/*.onnx
+
+# Personal profile — never commit
+.cos-profile.json
+
+# iCloud sync conflict duplicates, Python caches, backups
+* 2.*
+__pycache__/
+*.pyc
+*.bak*

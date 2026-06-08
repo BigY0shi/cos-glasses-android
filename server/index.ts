@@ -1,0 +1,211 @@
+// Load .env FIRST — ESM evaluates this module before subsequent imports,
+// ensuring process.env is populated before python-bridge.ts reads COS_SCRIPTS_DIR.
+import './env.js'
+
+import express from 'express'
+import cors from 'cors'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { createServer as createHttpsServer } from 'node:https'
+import { readFileSync, existsSync } from 'node:fs'
+import { execSync } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
+import { healthRouter } from './routes/health.js'
+import { diagRouter } from './routes/diag.js'
+import { queryRouter } from './routes/query.js'
+import { transcribeRouter } from './routes/transcribe.js'
+import { displayRouter } from './routes/display.js'
+import { transcribeStreamRouter } from './routes/transcribe-stream.js'
+import { openaiCompatRouter } from './routes/openai-compat.js'
+import { openaiKeyRouter } from './routes/openai-key.js'
+import { prewarmContext } from './lib/context-builder.js'
+import { preWarmCLI } from './lib/claude-bridge.js'
+import { startWhisperServer, stopWhisperServer } from './lib/whisper-local.js'
+import { initSileroVAD } from './lib/vad-silero.js'
+import { initSessionCache } from './lib/session-cache-writer.js'
+import { initSpeakerEmbeddings } from './lib/speaker-embeddings.js'
+import { logActiveSessionsOnShutdown, startAutoSnapshot } from './lib/conversation.js'
+
+const app = express()
+const PORT = parseInt(process.env.PORT ?? '3141', 10)
+
+// Mode detection — COS mode when a full pipeline directory is configured.
+// Standalone (default): glasses + your local Claude Code CLI only.
+export const COS_MODE = !!process.env.COS_SCRIPTS_DIR
+
+// Bind host: the glasses' phone app must reach this server over your network or
+// mesh (e.g. Tailscale), so the default is 0.0.0.0 (all interfaces). The IP
+// allowlist below still blocks untrusted public traffic. Set BIND_HOST=127.0.0.1
+// to restrict to localhost only.
+const BIND_HOST = process.env.BIND_HOST ?? '0.0.0.0'
+
+// API token — auto-generate if not set so every session is authenticated.
+const API_TOKEN_AUTO = !process.env.COS_API_TOKEN
+const API_TOKEN = process.env.COS_API_TOKEN ?? `_${randomBytes(32).toString('base64url')}`
+process.env.COS_API_TOKEN = API_TOKEN  // make available to routes that check it
+
+// Server metrics — shared with /api/health for monitoring
+export const serverMetrics = {
+  startedAt: Date.now(),
+  requestCount: 0,
+}
+
+// IP allowlist — only accept connections from localhost, meshnet, and private networks.
+// Blocks untrusted public access (coffee-shop WiFi, the open internet) while keeping all
+// local + meshnet (Tailscale/CGNAT) + LAN consumers working.
+app.use((req, res, next) => {
+  const ip = req.ip || req.socket.remoteAddress || ''
+  // Normalize IPv6-mapped IPv4 (::ffff:127.0.0.1 → 127.0.0.1)
+  const cleanIp = ip.replace(/^::ffff:/, '')
+  const allowed =
+    cleanIp === '127.0.0.1' || cleanIp === '::1' ||               // localhost
+    /^100\./.test(cleanIp) ||                                       // meshnet (CGNAT)
+    /^10\./.test(cleanIp) ||                                        // private 10.x
+    /^172\.(1[6-9]|2\d|3[01])\./.test(cleanIp) ||                  // private 172.16-31.x
+    /^192\.168\./.test(cleanIp)                                     // private 192.168.x
+  if (!allowed) {
+    res.status(403).json({ error: 'forbidden — not on allowed network' })
+    return
+  }
+  next()
+})
+
+// Allow localhost + LAN IPs (glasses WebView accesses server over LAN)
+app.use(cors({
+  origin: (origin, cb) => {
+    // Allow requests with no origin (same-origin, curl, SSE) or "null" origin (file:// WebViews like Even Hub)
+    if (!origin || origin === 'null') return cb(null, true)
+    // Allow localhost variants
+    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return cb(null, true)
+    // Allow private network IPs (10.x.x.x, 172.16-31.x.x, 192.168.x.x, 100.x.x.x for Meshnet/CGNAT)
+    if (/^https?:\/\/(10|172\.(1[6-9]|2\d|3[01])|192\.168|100)(\.\d+){2,3}(:\d+)?$/.test(origin)) return cb(null, true)
+    cb(new Error('CORS blocked'))
+  },
+}))
+app.use(express.json({ limit: '10mb' }))
+
+// Auth middleware — always active (token is auto-generated if not set)
+app.use('/api', (req, res, next) => {
+  // Allow health checks, display stream, and client diagnostics without auth.
+  // Diagnostics are whitelisted because the client needs to report crashes
+  // that may happen before the wizard has supplied an API token, and
+  // enforcing auth on a debug telemetry endpoint adds risk during the exact
+  // boot window we're trying to observe.
+  if (
+    req.path === '/health' ||
+    req.path === '/display-stream' ||
+    req.path === '/diag/client' ||
+    req.path === '/diag/health'
+  ) return next()
+  if (req.headers['x-cos-token'] !== API_TOKEN) {
+    return res.status(401).json({ error: 'unauthorized' })
+  }
+  next()
+})
+
+// Request counter — must be before route registrations
+app.use((_req, _res, next) => {
+  serverMetrics.requestCount++
+  next()
+})
+
+// API routes
+app.use('/api', healthRouter)
+app.use('/api', diagRouter)
+app.use('/api', queryRouter)
+app.use('/api', transcribeRouter)
+app.use('/api', displayRouter)
+app.use('/api', transcribeStreamRouter)
+app.use('/api', openaiKeyRouter)
+
+// OpenAI-compatible endpoint for the G2 Agent (ER "Add Agent")
+// Mounted at root — routes are /v1/chat/completions and /v1/models
+app.use(openaiCompatRouter)
+
+// Friendly root — this is an API server. The glasses client ships as the Even Hub
+// app (the .ehpk), not from here. A browser hitting the host sees a status page.
+app.get('/', (_req, res) => {
+  res.type('html').send(
+    '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>COS Glasses Server</title>' +
+    '<body style="font-family:system-ui,sans-serif;max-width:40rem;margin:4rem auto;padding:0 1.25rem;line-height:1.6;color:#111">' +
+    '<h1 style="font-size:1.4rem">COS Glasses Server</h1>' +
+    '<p>Running. This is the local API for the <strong>COS Glasses</strong> app on Even G2 smart glasses.</p>' +
+    '<ul><li>Health: <a href="/api/health">/api/health</a></li>' +
+    '<li>Setup guide: <a href="https://www.gotcos.com">gotcos.com</a></li></ul>' +
+    '<p style="color:#666;font-size:.9rem">Install the client from the Even Hub, then point it at this server\'s address + token.</p></body>'
+  )
+})
+
+// Graceful shutdown — stop whisper-server child process
+process.on('SIGTERM', () => { stopWhisperServer(); process.exit(0) })
+process.on('SIGINT', () => { logActiveSessionsOnShutdown(); stopWhisperServer(); process.exit(0) })
+
+// Crash protection — log and survive instead of dying mid-meeting
+process.on('uncaughtException', (err) => {
+  console.error('[CRASH GUARD] Uncaught exception (server stays alive):', err.message)
+  console.error(err.stack)
+})
+process.on('unhandledRejection', (reason: any) => {
+  console.error('[CRASH GUARD] Unhandled rejection (server stays alive):', reason?.message ?? reason)
+  if (reason?.stack) console.error(reason.stack)
+})
+
+// Start HTTPS alongside HTTP — Even Hub WebView prefers HTTPS (iOS ATS).
+// Optional: drop cert.pem + key.pem in server/certs/ (e.g. via mkcert) to enable.
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const HTTPS_PORT = parseInt(process.env.HTTPS_PORT ?? '3143', 10)
+const certDir = path.join(__dirname, 'certs')
+if (existsSync(path.join(certDir, 'cert.pem'))) {
+  const httpsServer = createHttpsServer({
+    cert: readFileSync(path.join(certDir, 'cert.pem')),
+    key: readFileSync(path.join(certDir, 'key.pem')),
+  }, app)
+  httpsServer.listen(HTTPS_PORT, BIND_HOST, () => {
+    console.log(`[COS API] HTTPS server running on https://${BIND_HOST}:${HTTPS_PORT}`)
+  })
+} else {
+  console.log('[COS API] No certs found — HTTPS disabled (drop cert.pem/key.pem in server/certs to enable)')
+}
+
+app.listen(PORT, BIND_HOST, () => {
+  console.log(`[COS API] HTTP server running on http://${BIND_HOST}:${PORT}`)
+  console.log(`[COS API] Mode: ${COS_MODE ? 'COS pipeline' : 'standalone'}`)
+
+  // Print the full API token when auto-generated — the user pastes it into the app.
+  if (API_TOKEN_AUTO) {
+    console.log('')
+    console.log(`[COS API] API Token: ${API_TOKEN}`)
+    console.log('[COS API]   ^ paste this into the COS Glasses app (set COS_API_TOKEN in .env for a fixed token)')
+    console.log('')
+  }
+
+  // Check Claude CLI availability — the chat backend
+  try {
+    execSync('claude --version', { timeout: 5000, stdio: 'pipe' })
+    console.log('[COS API] Claude Code CLI detected')
+  } catch {
+    console.warn('[COS API] Claude Code CLI not found — install from https://claude.ai/download')
+    console.warn('[COS API]   AI queries will not work without the Claude Code CLI')
+  }
+
+  if (COS_MODE) {
+    initSessionCache()
+    // Pre-warm context cache so first query doesn't wait for the pipeline
+    prewarmContext()
+  }
+  // Start local whisper-server (model stays in RAM for ~50ms transcription)
+  startWhisperServer().catch(err => console.error('[startup] Whisper server error:', err))
+  // Initialize speaker embeddings (voiceprint-based diarization) — fails soft if model absent
+  const embeddingOk = initSpeakerEmbeddings()
+  console.log(`[startup] Speaker embeddings: ${embeddingOk ? 'active' : 'disabled (model not found)'}`)
+  // Initialize Silero VAD (silence trimming before Whisper) — fails soft if model absent
+  const vadOk = initSileroVAD()
+  console.log(`[startup] Silero VAD: ${vadOk ? 'active' : 'disabled (model not found)'}`)
+
+  // Pre-warm the Claude CLI so the first query doesn't eat a 2-15s cold start
+  preWarmCLI().catch(err => console.error('[startup] CLI pre-warm error:', err))
+
+  // Auto-snapshot active sessions every 5 min (survives restarts)
+  startAutoSnapshot(5 * 60_000)
+})
