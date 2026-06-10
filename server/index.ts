@@ -151,7 +151,7 @@ process.on('unhandledRejection', (reason: any) => {
   if (reason?.stack) console.error(reason.stack)
 })
 
-// Start HTTPS alongside HTTP — Even Hub WebView prefers HTTPS (iOS ATS).
+// Start HTTPS alongside HTTP — some Even Hub WebViews prefer HTTPS.
 // Optional: drop cert.pem + key.pem in server/certs/ (e.g. via mkcert) to enable.
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const HTTPS_PORT = parseInt(process.env.HTTPS_PORT ?? '3143', 10)

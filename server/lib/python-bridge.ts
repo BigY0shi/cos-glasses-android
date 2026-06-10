@@ -23,7 +23,12 @@ if (!COS_SCRIPTS_DIR) {
   console.log('[COS] Standalone mode — glasses + Claude only (set COS_SCRIPTS_DIR for the full pipeline)')
 }
 
-export const PYTHON_BIN: string | null = COS_SCRIPTS_DIR ? resolve(COS_SCRIPTS_DIR, 'venv/bin/python3') : null
+// Windows venvs put the interpreter at venv\Scripts\python.exe; POSIX at venv/bin/python3.
+export const PYTHON_BIN: string | null = COS_SCRIPTS_DIR
+  ? (process.platform === 'win32'
+      ? resolve(COS_SCRIPTS_DIR, 'venv', 'Scripts', 'python.exe')
+      : resolve(COS_SCRIPTS_DIR, 'venv', 'bin', 'python3'))
+  : null
 const BRIDGE_SCRIPT: string | null = COS_SCRIPTS_DIR ? resolve(COS_SCRIPTS_DIR, 'cos_api_bridge.py') : null
 
 // The optional Python bridge is available only when the user points us at a real

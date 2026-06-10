@@ -53,10 +53,14 @@ if (nodeMajor < 20 || (nodeMajor === 20 && nodeMinor < 11)) {
 }
 console.log(green('  ✓') + ` Node.js ${process.versions.node}`)
 
+const IS_WINDOWS = process.platform === 'win32'
+
 // Step 2: agent CLI detection — at least one of Claude Code / Codex is required
+// shell: true picks the platform default (cmd.exe on Windows, /bin/sh elsewhere);
+// `2>&1` redirection is valid in both.
 function getCliVersion(command) {
   try {
-    return execSync(`${command} --version 2>&1`, { shell: '/bin/sh', stdio: 'pipe', timeout: 5000 }).toString().trim()
+    return execSync(`${command} --version 2>&1`, { shell: true, stdio: 'pipe', timeout: 5000 }).toString().trim()
   } catch {
     return null
   }
@@ -128,7 +132,18 @@ if (!existsSync(PROFILE_FILE) && existsSync(PROFILE_EXAMPLE)) {
 if (!process.env.COS_PROFILE_PATH) process.env.COS_PROFILE_PATH = PROFILE_FILE
 
 // Step 5: local Whisper detection + model download (free voice; OpenAI fallback otherwise)
-const WHISPER_KNOWN_PATHS = ['/opt/homebrew/bin/whisper-cli', '/usr/local/bin/whisper-cli']
+// Known install locations beyond the PATH: Homebrew/Linuxbrew on POSIX,
+// scoop/chocolatey on Windows.
+const WHISPER_KNOWN_PATHS = IS_WINDOWS
+  ? [
+      join(homedir(), 'scoop', 'shims', 'whisper-cli.exe'),
+      'C:\\ProgramData\\chocolatey\\bin\\whisper-cli.exe',
+    ]
+  : [
+      '/opt/homebrew/bin/whisper-cli',
+      '/usr/local/bin/whisper-cli',
+      '/home/linuxbrew/.linuxbrew/bin/whisper-cli',
+    ]
 const WHISPER_MODEL_DIR = join(homedir(), '.local/share/whisper-models')
 const WHISPER_MODEL_PATH = join(WHISPER_MODEL_DIR, 'ggml-large-v3-turbo.bin')
 const WHISPER_MODEL_PARTIAL = WHISPER_MODEL_PATH + '.partial'
@@ -137,8 +152,10 @@ const WHISPER_MODEL_MIN_BYTES = 800_000_000
 function findWhisperCli() {
   for (const p of WHISPER_KNOWN_PATHS) { if (existsSync(p)) return p }
   try {
-    const found = execSync('command -v whisper-cli 2>/dev/null', { shell: '/bin/sh', stdio: 'pipe', timeout: 2000 }).toString().trim()
-    return found || null
+    // `where` (cmd.exe) / `command -v` (sh) — both print the resolved path.
+    const probe = IS_WINDOWS ? 'where whisper-cli' : 'command -v whisper-cli'
+    const found = execSync(probe, { shell: true, stdio: 'pipe', timeout: 2000 }).toString().trim()
+    return found.split('\n')[0].trim() || null
   } catch {
     return null
   }
@@ -175,7 +192,15 @@ if (whisperCliPath && hasValidModel) {
   }
 } else {
   console.log(yellow('  ⚠') + ' whisper.cpp not installed ' + dim('— voice will use OpenAI API ($0.006/min)'))
-  console.log('    Free local voice: ' + bold('brew install whisper-cpp') + dim('  (no Homebrew? https://brew.sh)'))
+  if (process.platform === 'darwin') {
+    console.log('    Free local voice: ' + bold('brew install whisper-cpp') + dim('  (no Homebrew? https://brew.sh)'))
+  } else if (IS_WINDOWS) {
+    console.log('    Free local voice: download a whisper.cpp release build and add it to your PATH')
+    console.log('    ' + bold('https://github.com/ggml-org/whisper.cpp/releases'))
+  } else {
+    console.log('    Free local voice: ' + bold('brew install whisper-cpp') + dim(' (Linuxbrew)') + ' or build from source:')
+    console.log('    ' + bold('https://github.com/ggml-org/whisper.cpp'))
+  }
 }
 
 // Step 6: phone reachability — the glasses' phone app must reach this server.

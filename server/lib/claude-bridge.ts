@@ -8,9 +8,9 @@
 
 import { spawn } from 'node:child_process'
 import { writeFileSync, readFileSync, unlinkSync, existsSync } from 'node:fs'
-import { join } from 'node:path'
 import { appendFileSync } from 'node:fs'
 import crypto from 'node:crypto'
+import { tmpPath } from './platform.js'
 import { COS_SCRIPTS_DIR } from './python-bridge.js'
 import { logTokenAudit } from './token-audit.js'
 import { buildSystemPrompt, buildLightweightSystemPrompt, buildPrewarmSystemPrompt, getCachedContextInstant } from './context-builder.js'
@@ -56,9 +56,9 @@ let preWarmedCliSessionId: string | null = null
 let preWarmInProgress = false
 
 // ─── CLI session disk persistence ───
-// Persists CLI session IDs to /tmp (NOT server/data/ — iCloud sync risk).
+// Persists CLI session IDs to the OS temp dir (NOT server/data/ — cloud-sync risk).
 // Survives server restarts. TTL: 2 hours (matches conversation SESSION_TTL_MS).
-const CLI_SESSIONS_FILE = '/tmp/cos-cli-sessions.json'
+const CLI_SESSIONS_FILE = tmpPath('cos-cli-sessions.json')
 const CLI_SESSION_TTL_MS = 2 * 60 * 60_000  // 2 hours
 
 interface CliSessionsData {
@@ -345,7 +345,7 @@ export async function callClaudeStreaming(
   if (images && images.length > 0) {
     for (const img of images) {
       const id = crypto.randomUUID().slice(0, 8)
-      const p = join('/tmp', `cos-vision-${id}.jpg`)
+      const p = tmpPath(`cos-vision-${id}.jpg`)
       writeFileSync(p, Buffer.from(img, 'base64'))
       imagePaths.push(p)
     }

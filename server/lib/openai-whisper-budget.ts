@@ -49,7 +49,7 @@ export class OpenAIWhisperBudgetExhaustedError extends Error {
       `OpenAI Whisper daily budget exhausted: $${state.usdToday.toFixed(4)}/$${DAILY_USD_CAP.toFixed(2)} ` +
       `(${state.secondsToday.toFixed(0)}s of audio across ${state.callsToday} calls today). ` +
       `Cause: whisper-server is unhealthy — fix it before transcription resumes. ` +
-      `Recovery: pkill -9 -f whisper-server && restart cos-glasses server (auto-restarts model).`
+      `Recovery: restart the cos-glasses server (kills and auto-restarts whisper-server + model).`
     super(msg)
     this.name = 'OpenAIWhisperBudgetExhaustedError'
     this.spentTodayUsd = state.usdToday

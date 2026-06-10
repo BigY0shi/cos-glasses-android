@@ -1,18 +1,19 @@
 // Local Whisper transcription via whisper-server (persistent) or whisper-cli (fallback)
-// Eliminates 1-3s OpenAI API round-trip by running inference on M3 Ultra locally.
+// Eliminates 1-3s OpenAI API round-trip by running inference on the host machine.
 //
 // Strategy (fastest → slowest):
 //   1. whisper-server (persistent daemon, model in RAM) → ~50-100ms
 //   2. whisper-cli (spawned per request, model loaded from disk) → ~500-700ms
 //   3. OpenAI API (cloud, handled by transcribe.ts) → ~1000-3000ms
 
-import { spawn, execSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { writeFileSync, unlinkSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { homedir } from 'node:os'
+import { homedir, cpus } from 'node:os'
 import crypto from 'node:crypto'
 import { getVocabulary, getOwnerName } from './profile.js'
 import { stripBrandUrls } from './hallucination-filter.js'
+import { findBinary, killProcessByName, waitForPortFree, tmpPath } from './platform.js'
 
 // Prompt hardening flags (transcription quality, 2026-05-29):
 //   COS_PROMPT_V2 — drop the trailing '.' on the vocab prompt and join prompt+context
@@ -46,18 +47,21 @@ interface WhisperVerboseResponse {
   segments?: WhisperSegment[]
 }
 
-// Resolve whisper.cpp binaries across Homebrew prefixes (Apple Silicon
-// /opt/homebrew, Intel /usr/local). Downstream code existsSync-guards these
-// before use, so a missing binary degrades to CLI/cloud rather than crashing.
+// Resolve whisper.cpp binaries via PATH + package-manager locations (Homebrew,
+// Linuxbrew, scoop/choco/winget — see platform.ts). Downstream code
+// existsSync-guards these before use, so a missing binary degrades to
+// CLI/cloud rather than crashing ('' never exists).
 function resolveWhisperBin(name: string): string {
-  for (const prefix of ['/opt/homebrew/bin', '/usr/local/bin']) {
-    if (existsSync(`${prefix}/${name}`)) return `${prefix}/${name}`
-  }
-  return `/opt/homebrew/bin/${name}`
+  return findBinary(name) ?? ''
 }
 const WHISPER_CLI = resolveWhisperBin('whisper-cli')
 const WHISPER_SERVER = resolveWhisperBin('whisper-server')
-const MODEL_PATH = join(process.env.HOME ?? homedir(), '.local/share/whisper-models/ggml-large-v3-turbo.bin')
+const MODEL_PATH = join(homedir(), '.local/share/whisper-models/ggml-large-v3-turbo.bin')
+
+// Thread count scales with the host CPU (was hardcoded for a Mac Studio M3
+// Ultra). Leave 2 cores for the Node server + OS; clamp to whisper.cpp's
+// sweet spot of 16 for short audio chunks.
+const WHISPER_THREADS = String(Math.max(2, Math.min(16, cpus().length - 2)))
 
 // Post-meeting batch transcription uses the full 32-layer Whisper large-v3
 // instead of turbo's 4-layer decoder. Bake-off on 2026-04-16 showed the full
@@ -71,7 +75,7 @@ const MODEL_PATH = join(process.env.HOME ?? homedir(), '.local/share/whisper-mod
 // DISABLE: set COS_BATCH_LARGE_V3=0 to revert HQ path to turbo. Missing-weights
 // case is defensive: if ggml-large-v3.bin isn't on disk we log a warning and
 // fall back to turbo automatically — no broken batch runs.
-const BATCH_MODEL_LARGE_V3 = join(process.env.HOME ?? homedir(), '.local/share/whisper-models/ggml-large-v3.bin')
+const BATCH_MODEL_LARGE_V3 = join(homedir(), '.local/share/whisper-models/ggml-large-v3.bin')
 const BATCH_MODEL_TURBO = MODEL_PATH
 const BATCH_LARGE_V3_ENABLED = process.env.COS_BATCH_LARGE_V3 !== '0'
 
@@ -84,7 +88,7 @@ const BATCH_LARGE_V3_ENABLED = process.env.COS_BATCH_LARGE_V3 !== '0'
 // DISABLE: set COS_WHISPER_VAD=0 to revert to the pre-2026-04-16 behaviour. If VAD
 // regresses (e.g. trims quiet speakers on Zoom-through-laptop-mic), that env var
 // lets the user fall back fast without a redeploy.
-const VAD_MODEL_PATH = join(process.env.HOME ?? homedir(), '.local/share/whisper-models/ggml-silero-v5.1.2.bin')
+const VAD_MODEL_PATH = join(homedir(), '.local/share/whisper-models/ggml-silero-v5.1.2.bin')
 const VAD_ENABLED = process.env.COS_WHISPER_VAD !== '0'
 
 /** Pick the batch model path. Prefer large-v3 when enabled + on disk; fall
@@ -178,29 +182,21 @@ export async function startWhisperServer(): Promise<void> {
     }
   } catch {
     // Not running — kill any zombie processes before starting fresh
-    try {
-      execSync('pkill -9 -f "whisper-server"', { stdio: 'ignore' })
+    if (killProcessByName('whisper-server')) {
       console.log('[whisper-local] Killed stale whisper-server processes')
-    } catch { /* none running */ }
+    }
 
     // Wait for port to actually clear (up to 5s)
-    for (let i = 0; i < 10; i++) {
-      try {
-        execSync('lsof -i :8178 -t', { stdio: 'ignore' })
-        await new Promise(r => setTimeout(r, 500))
-      } catch {
-        break // Port clear
-      }
-    }
+    await waitForPortFree(WHISPER_SERVER_PORT, 10, 500)
   }
 
   // Assemble startup args. VAD only attaches if the ggml model is actually on
   // disk — missing-file is logged, not fatal (server still boots without VAD).
   const serverArgs = [
     '-m', MODEL_PATH,
-    '-t', '16',           // M3 Ultra has 24P+8E cores — 16 threads for short audio chunks
+    '-t', WHISPER_THREADS,  // Scales with host CPU (see WHISPER_THREADS)
     '-l', 'en',
-    '-fa',                // Flash attention — faster self-attention on Apple Silicon
+    '-fa',                // Flash attention — faster self-attention where supported
     '--no-speech-thold', '0.7',  // Reject silence more aggressively (default 0.6)
     // DTW removed: 'large-v3-turbo' not a valid preset, crashes server (exit 3)
     // Also incompatible with -fa (flash attention). Revisit word timestamps separately.
@@ -330,7 +326,7 @@ export async function transcribeHighQuality(audioBuffer: Buffer, context?: strin
 
   const start = Date.now()
   const id = crypto.randomUUID().slice(0, 8)
-  const tmpWav = join('/tmp', `cos-whisper-hq-${id}.wav`)
+  const tmpWav = tmpPath(`cos-whisper-hq-${id}.wav`)
 
   const modelPath = resolveBatchModel()
   const useLargeV3 = modelPath === BATCH_MODEL_LARGE_V3
@@ -343,7 +339,7 @@ export async function transcribeHighQuality(audioBuffer: Buffer, context?: strin
       const args = [
         '-m', modelPath,
         '-f', tmpWav,
-        '-t', '16',           // Use more threads for batch (no real-time pressure)
+        '-t', WHISPER_THREADS,  // Scales with host CPU (no real-time pressure)
         '-l', 'en',
         '-fa',                // Flash attention — Metal win, same flag streaming uses
         '-bs', '5',           // Beam search width 5 (default disabled)
@@ -470,7 +466,7 @@ async function transcribeViaServer(audioBuffer: Buffer, context?: string, isQuie
  */
 async function transcribeViaCLI(audioBuffer: Buffer, context?: string, isQuiet?: boolean): Promise<string> {
   const id = crypto.randomUUID().slice(0, 8)
-  const tmpWav = join('/tmp', `cos-whisper-${id}.wav`)
+  const tmpWav = tmpPath(`cos-whisper-${id}.wav`)
 
   try {
     writeFileSync(tmpWav, audioBuffer)
@@ -479,7 +475,7 @@ async function transcribeViaCLI(audioBuffer: Buffer, context?: string, isQuiet?:
       const proc = spawn(WHISPER_CLI, [
         '-m', MODEL_PATH,
         '-f', tmpWav,
-        '-t', '12',
+        '-t', WHISPER_THREADS,
         '-l', 'en',
         '-fa',
         '--no-timestamps',
@@ -661,19 +657,10 @@ async function restartWhisperServer(): Promise<void> {
       serverProcess = null
     }
     // Also kill any zombie processes
-    try {
-      execSync('pkill -9 -f "whisper-server"', { stdio: 'ignore' })
-    } catch { /* none running */ }
+    killProcessByName('whisper-server')
 
     // Wait for port to clear
-    for (let i = 0; i < 6; i++) {
-      try {
-        execSync('lsof -i :8178 -t', { stdio: 'ignore' })
-        await new Promise(r => setTimeout(r, 500))
-      } catch {
-        break
-      }
-    }
+    await waitForPortFree(WHISPER_SERVER_PORT, 6, 500)
 
     console.log('[whisper-local] Restarting whisper-server (model load ~20s)...')
     await startWhisperServer()

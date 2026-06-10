@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
+import { tmpPath } from './platform.js'
 import type { CodexModelPreference } from '../../shared/model-preference.js'
 
 export const CODEX_ENGINE_SESSION_TTL_MS = 2 * 60 * 60_000
@@ -28,7 +29,7 @@ function sessionKey(cosSessionId: string, model: CodexModelPreference): string {
 }
 
 export function getCodexEngineSessionPath(): string {
-  return resolve(process.env.COS_CODEX_ENGINE_SESSIONS_FILE || '/tmp/cos-codex-engine-sessions.json')
+  return resolve(process.env.COS_CODEX_ENGINE_SESSIONS_FILE || tmpPath('cos-codex-engine-sessions.json'))
 }
 
 function expiresAtFrom(now: number): string {

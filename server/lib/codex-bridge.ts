@@ -3,8 +3,8 @@
 
 import { spawn } from 'node:child_process'
 import { writeFileSync, unlinkSync } from 'node:fs'
-import { join } from 'node:path'
 import crypto from 'node:crypto'
+import { tmpPath } from './platform.js'
 import { logTokenAudit } from './token-audit.js'
 import { buildSystemPrompt, buildLightweightSystemPrompt } from './context-builder.js'
 import {
@@ -224,7 +224,7 @@ export async function callCodexStreaming(
     if (images && images.length > 0) {
       for (const img of images) {
         const id = crypto.randomUUID().slice(0, 8)
-        const p = join('/tmp', `cos-vision-${id}.jpg`)
+        const p = tmpPath(`cos-vision-${id}.jpg`)
         writeFileSync(p, Buffer.from(img, 'base64'))
         imagePaths.push(p)
       }

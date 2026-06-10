@@ -12,8 +12,8 @@
 
 import { spawn } from 'node:child_process'
 import { writeFileSync, readFileSync, unlinkSync, existsSync } from 'node:fs'
-import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { tmpPath } from './platform.js'
 
 const FFMPEG_TIMEOUT_MS = 30_000
 const FILTER_CHAIN = 'highpass=f=80,afftdn=nt=w,loudnorm=I=-16:LRA=11:TP=-1.5'
@@ -27,8 +27,8 @@ const FILTER_CHAIN = 'highpass=f=80,afftdn=nt=w,loudnorm=I=-16:LRA=11:TP=-1.5'
  */
 export async function enhanceAudio(audioBuffer: Buffer): Promise<Buffer> {
   const id = randomUUID().slice(0, 8)
-  const inputPath = join('/tmp', `cos-enhance-in-${id}`)
-  const outputPath = join('/tmp', `cos-enhance-out-${id}.wav`)
+  const inputPath = tmpPath(`cos-enhance-in-${id}`)
+  const outputPath = tmpPath(`cos-enhance-out-${id}.wav`)
 
   try {
     writeFileSync(inputPath, audioBuffer)
